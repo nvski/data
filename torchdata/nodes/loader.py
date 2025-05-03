@@ -18,9 +18,10 @@ class Loader(Generic[T]):
     Args:
         root (BaseNode[T]): The root node of the data pipeline.
         restart_on_stop_iteration (bool): Whether to restart the iterator when it reaches the end. Default is True
+        restart_on_double_iter_call (bool): Whether to supress restart when iter is called twice in a row, e.g. in lightning
     """
 
-    def __init__(self, root: BaseNode[T], restart_on_stop_iteration: bool = True):
+    def __init__(self, root: BaseNode[T], restart_on_stop_iteration: bool = True, restart_on_double_iter_call: bool = True):
         super().__init__()
         self.root = root
         self.restart_on_stop_iteration = restart_on_stop_iteration
@@ -36,6 +37,10 @@ class Loader(Generic[T]):
         # it = iter(loader)  # We don't want to reset the iterator here again
         # for _ in it: ...
         self._iter_for_state_dict: bool = False
+        # Some frameworks might call iter twice in a row
+        # we might want to ignore repeated calls 
+        self.restart_on_double_iter_call = restart_on_double_iter_call
+
 
     def __iter__(self):
         if self._it is None:
@@ -43,6 +48,8 @@ class Loader(Generic[T]):
         elif self._iter_for_state_dict:
             self._iter_for_state_dict = False
             return self._it  # This was already pre-called to get a state dict
+        elif self._it._just_restarted and not self.restart_on_double_iter_call:
+            return self._it  # Pre-called iter without further __next__ calls
 
         if self._next_iter_state_dict is not None:
             self._it.reset(initial_state=self._next_iter_state_dict)
@@ -99,6 +106,7 @@ class LoaderIterator(BaseNode[T]):
         self.root = loader.root
         self._cached_item = None
         self._cached_state_dict: Optional[Dict[str, Any]] = None
+        self._just_restarted = False
         self._num_yielded = 0
 
     def reset(self, initial_state: Optional[Dict[str, Any]] = None):
@@ -110,8 +118,10 @@ class LoaderIterator(BaseNode[T]):
             self.root.reset(None)
             self._num_yielded = 0
         self._cached_item = None
+        self._just_restarted = True
 
     def has_next(self) -> bool:
+        _save_just_restarted = self._just_restarted
         if self._cached_item is None:
             try:
                 # Cache the current state dict
@@ -120,9 +130,11 @@ class LoaderIterator(BaseNode[T]):
                 self._cached_item = next(self)
             except StopIteration:
                 pass
+        self._just_restarted = _save_just_restarted
         return self._cached_item is not None
 
     def next(self):
+        self._just_restarted = False
         if self._cached_item is not None:
             item = self._cached_item
             self._cached_item = None
